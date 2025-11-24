@@ -1,141 +1,226 @@
-import requests
-import pandas as pd
-import time
 import os
+import time
+import csv
+import requests
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
-TMDB_API_KEY = "YOUR_API_KEY_HERE"
-OUTPUT_FILE = "tmdb_movies_full.csv"
+# ==============================================================================
+# CẤU HÌNH (CONFIG)
+# ==============================================================================
+# Thay bằng API Key của bạn hoặc đặt trong biến môi trường
+API_KEY = os.getenv("TMDB_API_KEY", "5bae744934d0a79c18c935e723ea8ac2")
 
-YEARS = range(2000, 2025)     # Lấy từ năm 2000 → 2024
-MAX_PAGES = 20                # Mỗi năm tối đa ~400 phim (20 trang * 20 phim)
+OUTPUT_FILE = "movies_dataset_revenue.csv"
+START_YEAR = 2000
+END_YEAR = 2024
+PAGES_PER_YEAR = 25   # 25 trang * 20 phim = 500 phim doanh thu cao nhất mỗi năm
+MAX_WORKERS = 10      # Số luồng xử lý song song
 
-# ========================================================
-# 1. Hàm gọi API TMDB an toàn (tự retry)
-# ========================================================
-def tmdb_get(url, params=None, max_retry=3):
-    if params is None: params = {}
-    params["api_key"] = TMDB_API_KEY
-    
-    for _ in range(max_retry):
+# Setup Log để dễ theo dõi
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ==============================================================================
+# HÀM GỌI API AN TOÀN (ROBUST REQUEST)
+# ==============================================================================
+def safe_get(url, params=None, max_retries=5):
+    """
+    Gửi request với cơ chế thử lại (retry) nếu gặp lỗi mạng hoặc Rate Limit (429).
+    """
+    if params is None:
+        params = {}
+    params["api_key"] = API_KEY
+
+    for attempt in range(max_retries):
         try:
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                return r.json()
+            response = requests.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            
+            elif response.status_code == 429:  # Rate Limit
+                retry_after = int(response.headers.get("Retry-After", 1))
+                logging.warning(f"Rate limit hit. Sleeping {retry_after}s...")
+                time.sleep(retry_after + 0.5)
+                continue
+            
+            else:
+                # Các lỗi 4xx, 5xx khác
+                logging.error(f"Request failed: {response.status_code} - {url}")
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error: {e}. Retrying {attempt+1}/{max_retries}...")
             time.sleep(1)
-        except:
-            time.sleep(1)
+    
     return None
 
-# ========================================================
-# 2. Lấy danh sách phim của 1 năm bằng discover
-# ========================================================
-def discover_movies_by_year(year):
-    movies = []
+# ==============================================================================
+# 1. LẤY DANH SÁCH ID THEO NĂM (STRATEGY: YEARLY REVENUE)
+# ==============================================================================
+def fetch_movie_ids_by_year(year):
+    """
+    Lấy danh sách ID phim trong 1 năm, sắp xếp theo doanh thu giảm dần.
+    Mục đích: Chỉ lấy những phim có dữ liệu doanh thu để train model.
+    """
+    movie_ids = []
+    base_url = "https://api.themoviedb.org/3/discover/movie"
     
-    for page in range(1, MAX_PAGES + 1):
-        print(f"  → Discover year {year}, page {page}")
-
-        data = tmdb_get(
-            "https://api.themoviedb.org/3/discover/movie",
-            {
-                "primary_release_year": year,
-                "sort_by": "revenue.desc",
-                "page": page
-            }
-        )
-
+    for page in range(1, PAGES_PER_YEAR + 1):
+        params = {
+            "primary_release_year": year,
+            "sort_by": "revenue.desc",  # QUAN TRỌNG: Ưu tiên phim có doanh thu
+            "page": page,
+            "vote_count.gte": 10        # Lọc bớt phim quá rác
+        }
+        data = safe_get(base_url, params)
+        
         if not data or "results" not in data:
             break
+            
+        for item in data["results"]:
+            movie_ids.append(item["id"])
+            
+        # Delay nhẹ giữa các trang discover
+        time.sleep(0.2)
+        
+    logging.info(f"Năm {year}: Tìm thấy {len(movie_ids)} phim tiềm năng.")
+    return movie_ids
 
-        movies.extend(data["results"])
-
-        # Dừng nếu hết phim
-        if page >= data.get("total_pages", 1):
-            break
-
-        time.sleep(0.3)
-
-    return movies
-
-# ========================================================
-# 3. Lấy chi tiết 1 phim (budget, revenue, runtime, genres…)
-# ========================================================
-def get_movie_details(movie_id):
-    data = tmdb_get(
-        f"https://api.themoviedb.org/3/movie/{movie_id}",
-        {"append_to_response": "credits"}
-    )
+# ==============================================================================
+# 2. LẤY CHI TIẾT (FEATURE ENGINEERING CHO REVENUE PREDICTION)
+# ==============================================================================
+def fetch_movie_details(movie_id):
+    """
+    Lấy tất cả đặc trưng cần thiết chỉ trong 1 request nhờ 'append_to_response'.
+    """
+    # Kỹ thuật lấy gộp: credits (diễn viên), keywords (từ khóa), release_dates (ngày phát hành)
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}"
+    params = {"append_to_response": "credits,keywords,release_dates"}
+    
+    data = safe_get(url, params)
+    
     if not data:
         return None
 
-    # Lấy đạo diễn
-    director = "Unknown"
-    for member in data.get("credits", {}).get("crew", []):
-        if member["job"] == "Director":
-            director = member["name"]
-            break
-
-    # 3 diễn viên chính
-    cast = data.get("credits", {}).get("cast", [])
-    top_cast = ", ".join(c["name"] for c in cast[:3])
-
-    # Genres
-    genres = ", ".join(g["name"] for g in data.get("genres", []))
-
-    # Production companies
-    companies = ", ".join(c["name"] for c in data.get("production_companies", []))
-
+    # --- Lọc dữ liệu rác ---
+    # Nếu doanh thu và ngân sách đều bằng 0 hoặc không có -> bỏ qua (hoặc giữ lại tùy chiến lược)
+    # Ở đây ta giữ lại để xử lý sau, nhưng ưu tiên data sạch.
+    revenue = data.get("revenue", 0)
+    budget = data.get("budget", 0)
+    
+    # --- Trích xuất đặc trưng (Features Extraction) ---
+    
+    # 1. Đạo diễn & Diễn viên (Top 5)
+    credits = data.get("credits", {})
+    directors = [m["name"] for m in credits.get("crew", []) if m["job"] == "Director"]
+    cast = [m["name"] for m in credits.get("cast", [])[:5]] # Lấy top 5 star power
+    
+    # 2. Keywords (Cực quan trọng cho Content-based)
+    keywords = [k["name"] for k in data.get("keywords", {}).get("keywords", [])]
+    
+    # 3. Thông tin sản xuất
+    production_companies = [c["name"] for c in data.get("production_companies", [])]
+    production_countries = [c["name"] for c in data.get("production_countries", [])]
+    genres = [g["name"] for g in data.get("genres", [])]
+    
+    # 4. Ngày phát hành chuẩn (Tại Mỹ - US release thường quan trọng nhất cho doanh thu)
+    release_date = data.get("release_date", "")
+    
     return {
-        "tmdb_id": movie_id,
+        "id": data.get("id"),
         "title": data.get("title"),
-        "release_date": data.get("release_date"),
-        "budget": data.get("budget"),
-        "revenue": data.get("revenue"),          # TARGET prediction
+        "release_date": release_date,
+        # "year": release_date[:4] if release_date else "",
+        # "month": release_date[5:7] if len(release_date) >= 7 else "", # Feature mùa vụ
+        
+        # Target Variables
+        "budget": budget,
+        "revenue": revenue,
+        
+        # Numeric Features
         "runtime": data.get("runtime"),
-        "vote_average": data.get("vote_average"),
+        "rating": data.get("vote_average"),
         "vote_count": data.get("vote_count"),
-        "genres": genres,
-        "production_companies": companies,
-        "director": director,
-        "top_cast": top_cast
+        "popularity": data.get("popularity"),
+        
+        # Categorical / Text Features
+        "genres": ", ".join(genres),
+        "production_companies": ", ".join(production_companies),
+        "production_countries": ", ".join(production_countries),
+        "director": ", ".join(directors),
+        "cast": ", ".join(cast),
+        "keywords": ", ".join(keywords),
+        "original_language": data.get("original_language"),
+        
+        # Series phim (Harry Potter, Marvel...) ảnh hưởng lớn doanh thu
+        "collection": data.get("belongs_to_collection", {}).get("name") if data.get("belongs_to_collection") else None
     }
 
-# ========================================================
-# 4. MAIN — Lấy toàn bộ dataset
-# ========================================================
+# ==============================================================================
+# 3. HÀM LƯU CSV
+# ==============================================================================
+def save_to_csv(data_list, filename, mode='a'):
+    if not data_list:
+        return
+    
+    file_exists = os.path.isfile(filename)
+    keys = data_list[0].keys()
+    
+    with open(filename, mode, newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        if not file_exists or mode == 'w':
+            writer.writeheader()
+        writer.writerows(data_list)
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
 def main():
-    all_rows = []
-    total = 0
+    print(f"=== BẮT ĐẦU CRAWL DỮ LIỆU ({START_YEAR}-{END_YEAR}) ===")
+    
+    # Xóa file cũ nếu muốn chạy lại từ đầu
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
 
-    print("\n======= BẮT ĐẦU THU THẬP DỮ LIỆU TMDB =======\n")
+    total_collected = 0
 
-    for year in YEARS:
-        print(f"\n----------------------------------------")
-        print(f"📌 Năm {year}")
-        print("----------------------------------------")
+    for year in range(START_YEAR, END_YEAR + 1):
+        logging.info(f"--> Đang xử lý năm: {year}")
+        
+        # B1: Lấy list ID
+        movie_ids = fetch_movie_ids_by_year(year)
+        if not movie_ids:
+            continue
+            
+        year_data = []
+        
+        # B2: Lấy chi tiết đa luồng
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_id = {executor.submit(fetch_movie_details, mid): mid for mid in movie_ids}
+            
+            for future in as_completed(future_to_id):
+                try:
+                    result = future.result()
+                    # Chỉ lấy phim có Doanh thu > 0 (Để train tốt hơn)
+                    if result and result['revenue'] > 0:
+                        year_data.append(result)
+                except Exception as e:
+                    logging.error(f"Error fetching movie: {e}")
 
-        discover_list = discover_movies_by_year(year)
-        print(f"  → Tìm thấy {len(discover_list)} phim")
+        # B3: Lưu ngay sau khi xong 1 năm (Checkpoint)
+        if year_data:
+            save_to_csv(year_data, OUTPUT_FILE, mode='a')
+            count = len(year_data)
+            total_collected += count
+            logging.info(f"    Đã lưu {count} phim của năm {year}. Tổng cộng: {total_collected}")
+        
+        # Nghỉ một chút giữa các năm để API thở
+        time.sleep(1)
 
-        for mv in discover_list:
-            movie_id = mv["id"]
-            print(f"    - Lấy details ID {movie_id}...")
-
-            details = get_movie_details(movie_id)
-            if details:
-                all_rows.append(details)
-                total += 1
-
-            time.sleep(0.3)  # Bảo vệ API
-
-        # Lưu checkpoint mỗi năm
-        df = pd.DataFrame(all_rows)
-        df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-        print(f"  → Đã lưu checkpoint ({len(all_rows)} phim tổng cộng)")
-
-    print("\n======= HOÀN TẤT =======")
-    print(f"📁 File lưu tại: {OUTPUT_FILE}")
-    print(f"📊 Tổng số phim: {total}")
+    print(f"\n=== HOÀN TẤT. TỔNG SỐ PHIM: {total_collected} ===")
+    print(f"File dữ liệu: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
